@@ -57,7 +57,6 @@
 │   ├── order_matching/
 │   ├── market_data/
 │   └── networking/
-├── docs/
 ├── HFT_OPTIMIZATIONS.md
 ├── SYSTEM_ARCHITECTURE.md
 └── README.md
@@ -69,7 +68,6 @@
 - `include/utils/`：内存池、无锁队列、异步日志、时间戳、benchmark 工具。
 - `include/networking/`：TCP/UDP 网络相关封装。
 - `src/`：示例程序和部分模块实现。
-- `docs/`：项目说明、简历材料和面试准备文档。
 
 ---
 
