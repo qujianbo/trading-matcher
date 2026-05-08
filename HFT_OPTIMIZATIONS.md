@@ -1,303 +1,466 @@
-# HFT Optimizations Guide
+# HFT 优化说明
 
-This document describes the High-Frequency Trading (HFT) optimizations implemented in this codebase, following industry best practices from leading HFT firms.
+本文档说明本项目中使用的高频交易（HFT）相关优化思路。项目目标不是实现完整交易所系统，而是通过一个可运行的订单簿与撮合示例，展示低延迟 C++ 系统中常见的数据结构、内存管理、计时、日志和 Linux 系统优化方法。
 
-## Overview
+## 总览
 
-The codebase has been refactored to achieve microsecond-level latency targets, which is critical for HFT systems. All optimizations are Linux-specific and designed for production trading environments.
+高频交易系统对延迟和抖动都很敏感。一次订单处理可能只允许微秒级甚至更低的预算，因此代码设计需要尽量减少：
 
-## Key Optimizations
+- 动态内存分配
+- 锁竞争
+- 不必要的系统调用
+- cache miss
+- 分支预测失败
+- 线程迁移
+- 日志和 I/O 对热路径的阻塞
 
-### 1. Fixed-Point Arithmetic
+本项目围绕这些目标做了一组基础优化。
 
-**Problem**: Floating-point operations are slower and can introduce rounding errors.
+---
 
-**Solution**: Prices are represented as 64-bit integers scaled by 1,000,000 (micro-dollar precision).
+## 1. 固定点价格表示
+
+### 问题
+
+金融系统中不适合直接使用浮点数表示价格。浮点数可能产生舍入误差，而且在部分场景中会带来不确定性。
+
+### 做法
+
+项目中价格使用 `int64_t` 表示，并按 `1,000,000` 放大：
 
 ```cpp
 using Price = int64_t;
 constexpr Price PRICE_SCALE = 1'000'000LL;
 ```
 
-**Benefits**:
-- Faster arithmetic operations
-- No floating-point rounding errors
-- Deterministic calculations
+例如：
 
-### 2. Cache-Optimized Data Structures
-
-**Order Structure**:
-- Tightly packed to 32 bytes (one cache line)
-- 32-byte alignment for optimal cache behavior
-- No padding waste
-
-**Price Ladder**:
-- Replaced `std::priority_queue` with sorted `std::map` for O(log n) insertion
-- O(1) best price access via `rbegin()`/`begin()`
-- Cache-friendly price level organization
-
-### 3. Memory Management
-
-**Memory Pool**:
-- Pre-allocated pool of Order objects (1M by default)
-- Zero dynamic allocations in hot path
-- Lock-free allocation using atomic operations
-
-**Memory Locking**:
-- `mlockall()` prevents swapping to disk
-- Critical for deterministic latency
-
-### 4. Linux-Specific Optimizations
-
-#### CPU Affinity & Thread Pinning
-```cpp
-hft::setCpuAffinity(cpu_id);        // Pin process to CPU
-hft::pinThreadToCpu(cpu_id);        // Pin current thread
-hft::pinThreadToCpu(thread, cpu_id); // Pin C++ thread
+```text
+100.50 -> 100500000
 ```
-- Reduces cache misses from context switching
-- Improves cache locality
-- Critical for deterministic latency
 
-#### NUMA Awareness
+### 好处
+
+- 避免浮点精度问题。
+- 整数比较和计算更确定。
+- 适合价格优先、时间优先的撮合逻辑。
+
+---
+
+## 2. 缓存友好的数据结构
+
+### Order 结构
+
+`Order` 被设计为 32 字节：
+
+```cpp
+struct alignas(32) Order
+```
+
+并通过静态断言固定大小和对齐：
+
+```cpp
+static_assert(sizeof(Order) == 32, "Order must be exactly 32 bytes");
+static_assert(alignof(Order) == 32, "Order must be 32-byte aligned");
+```
+
+常见 CPU cache line 是 64 字节，因此 32 字节的订单结构可以让两个订单较好地落在一条 cache line 中，提高缓存利用率。这里的目标不是让每个订单独占一条 cache line，而是在对象紧凑和访问效率之间做折中。
+
+### Price Ladder
+
+订单簿中使用价格档位管理订单：
+
+- 买盘按价格从低到高存储，最高买价通过 `rbegin()` 获取。
+- 卖盘按价格从低到高存储，最低卖价通过 `begin()` 获取。
+- 每个价格档位内部用 FIFO 顺序维护订单。
+
+当前实现使用 `std::map<Price, PriceLevel>`。它不是极致低延迟的数据结构，但结构清晰，适合展示价格档位和最优价查询逻辑。
+
+---
+
+## 3. 内存管理
+
+### Memory Pool
+
+项目提供了 `OrderMemoryPool`：
+
+```cpp
+template<size_t PoolSize = 1024 * 1024>
+class OrderMemoryPool
+```
+
+它会预先分配一批 `Order` 对象，避免热路径中频繁调用 `new` / `delete`。
+
+主要特点：
+
+- 默认预分配约 100 万个订单对象。
+- 使用原子递增索引分配对象。
+- 池内对象按数组连续存储，缓存局部性较好。
+- 池耗尽时才退回到堆分配。
+
+### 内存锁定
+
+Linux 下提供：
+
+```cpp
+mlockall(MCL_CURRENT | MCL_FUTURE)
+```
+
+作用是尽量防止进程内存被换出到磁盘。对低延迟系统来说，swap 会造成不可接受的延迟抖动。
+
+---
+
+## 4. Linux 系统级优化
+
+这些能力主要在 `LinuxOptimizations.hpp` 中实现，只在 Linux 下启用。
+
+### CPU 亲和性与线程绑定
+
+```cpp
+hft::setCpuAffinity(cpu_id);
+hft::pinThreadToCpu(cpu_id);
+hft::pinThreadToCpu(thread, cpu_id);
+```
+
+作用：
+
+- 减少线程在不同 CPU 核之间迁移。
+- 提高 cache locality。
+- 降低调度带来的延迟抖动。
+
+### NUMA 感知
+
 ```cpp
 int numa_node = hft::getNumaNode(cpu_id);
-hft::setMemoryPolicy(numa_node);     // Prefer NUMA node for allocations
-hft::bindThreadToNumaNode(numa_node); // Bind thread to NUMA node
-void* ptr = hft::allocateOnNumaNode(size, numa_node); // Allocate on specific node
+hft::setMemoryPolicy(numa_node);
+hft::bindThreadToNumaNode(numa_node);
+void* ptr = hft::allocateOnNumaNode(size, numa_node);
 ```
-- Allocates memory on the same NUMA node as the CPU
-- Reduces cross-NUMA memory access latency
-- Critical for multi-socket systems
-- Requires libnuma (optional, falls back gracefully)
 
-#### Real-Time Scheduling
+在多路 CPU 服务器上，不同 CPU 访问不同 NUMA 节点的内存延迟不同。NUMA 优化的目标是让线程尽量访问本地节点内存。
+
+项目中如果检测到 `libnuma`，会使用 NUMA API；否则退化为普通分配。
+
+### 实时调度
+
 ```cpp
-hft::setRealtimePriority(50);  // SCHED_FIFO
+hft::setRealtimePriority(50);
 ```
-- Prevents preemption by other processes
-- Requires root privileges
 
-#### Huge Pages
-- 2MB pages instead of 4KB
-- Reduces TLB misses
-- Configured via linker flags
+底层使用 `SCHED_FIFO`。它可以减少普通进程对交易线程的抢占，但通常需要 root 权限。生产环境中必须谨慎使用，避免高优先级线程长期占用 CPU。
 
-### 5. High-Resolution Timestamps
+### Huge Pages
 
-**RDTSC (Read Time-Stamp Counter)**:
-- Ultra-fast CPU cycle counter (< 10 cycles vs hundreds for system calls)
-- Used for latency measurements in hot paths
-- Calibrated at startup to convert cycles to nanoseconds
-- `LatencyTimerRDTSC` class for microsecond-level measurements
+普通页通常是 4KB，huge page 常见大小是 2MB。使用 huge pages 可以减少 TLB miss，适合大块内存池或高频访问的大数组。
 
-**clock_gettime()**:
-- Used for wall-clock timestamps (order timestamps)
-- More accurate for long durations
-- `LatencyTimer` class for standard measurements
+---
 
-**Performance Comparison**:
-- RDTSC: ~5-10 CPU cycles (~2-4 ns on 2.5 GHz CPU)
-- clock_gettime: ~100-300 CPU cycles (~40-120 ns)
-- **RDTSC is 10-30x faster** for latency measurements
+## 5. 高精度时间戳
 
-**Usage**:
+### RDTSC
+
+RDTSC 是 x86 CPU 的时间戳计数器读取指令，速度很快，适合测量短路径延迟。
+
+项目提供：
+
 ```cpp
-// Ultra-fast latency measurement (hot path)
+hft::rdtsc();
+hft::rdtscp();
+hft::LatencyTimerRDTSC;
+```
+
+`RDTSCCalibrator` 会在启动时估算 cycles 和 nanoseconds 之间的换算关系：
+
+```cpp
+hft::RDTSCCalibrator::calibrate();
+```
+
+### clock_gettime
+
+项目也提供基于 `clock_gettime` 的时间函数：
+
+```cpp
+hft::getTimestampNs();
+hft::getMonotonicNs();
+hft::LatencyTimer;
+```
+
+一般区分：
+
+- 订单时间戳：使用 wall-clock 时间。
+- 延迟测量：使用 monotonic 时间或 RDTSC。
+
+### 示例
+
+```cpp
 hft::LatencyTimerRDTSC timer;
-// ... operation ...
+
+// 执行待测逻辑
+
 int64_t latency_us = timer.elapsedUs();
 uint64_t cycles = timer.elapsedCycles();
-
-// Wall-clock timestamp (for orders)
-int64_t timestamp = hft::getTimestampNs();  // Uses clock_gettime
 ```
 
-### 6. Lock-Free SPSC Queue
+---
 
-**Single Producer Single Consumer Queue**:
-- Lock-free, wait-free operations
-- Cache-line aligned to avoid false sharing
-- Bounded circular buffer (power-of-2 size)
-- O(1) push/pop operations
-- No CAS loops in common case
+## 6. 无锁 SPSC 队列
 
-**Use Cases**:
-- Market data handler → Order matcher pipeline
-- Trade logging (async)
-- Latency measurement aggregation
-- Any producer-consumer pattern in hot paths
+SPSC 是 Single Producer Single Consumer，即单生产者、单消费者队列。
 
-**Performance**:
-- Push/Pop latency: < 50 ns (typical)
-- Zero allocations
-- No blocking, no locks
+项目中的 `SPSCQueue<T, Size>` 使用固定大小环形缓冲区：
 
-### 7. Async Logger
-
-**Non-Blocking Logging**:
-- SPSC queue-based message buffering
-- Background thread for I/O
-- Never blocks the hot path
-- Configurable log levels
-- File or stdout output
-
-**Features**:
-- Fixed-size message buffers (no allocations)
-- Thread ID tracking
-- Nanosecond timestamps
-- Automatic flushing
-- Drop messages if queue full (fail-fast)
-
-**Usage**:
 ```cpp
-LOG_INFO("Message");  // Non-blocking
-LOG_INFO_F("Format: %d", value);  // Formatted
+template<typename T, size_t Size>
+class SPSCQueue
 ```
 
-### 8. Network Optimizations
+特点：
 
-**Epoll-Based TCP Server**:
-- Edge-triggered epoll for maximum efficiency
-- Non-blocking I/O
-- TCP_NODELAY to disable Nagle's algorithm
-- SO_REUSEPORT for load balancing
+- 单生产者单消费者场景下无需互斥锁。
+- 使用 `std::atomic` 管理读写位置。
+- 队列容量在编译期确定。
+- 使用 cache line 对齐减少 false sharing。
+- push/pop 都是 O(1)。
 
-**UDP Server with Busy Polling**:
-- `UDPServer` class with SO_BUSY_POLL support
-- Busy polling reduces latency by polling in kernel space
-- Non-blocking UDP with configurable busy poll timeout (50-200μs typical)
-- `UDPMulticastReceiver` for market data feeds
-- SO_INCOMING_CPU for CPU affinity (with SO_REUSEPORT)
+适用场景：
 
-**Busy Polling Benefits**:
-- Reduces latency by 10-50μs vs blocking I/O
-- Kernel polls socket queue without going to sleep
-- CPU-intensive but critical for microsecond-level latency
-- Use with dedicated CPU cores
+- 行情线程到撮合线程的数据传递。
+- 异步日志消息传递。
+- 延迟统计采样传递。
 
-**Usage**:
+限制：
+
+- 只适合单生产者、单消费者。
+- 多生产者或多消费者场景需要 MPSC/MPMC 队列。
+
+---
+
+## 7. 异步日志
+
+日志如果直接写文件，会引入 I/O 阻塞，影响热路径延迟。
+
+项目中的 `AsyncLogger` 做法是：
+
+1. 业务线程构造 `LogMessage`。
+2. 将日志消息推入 SPSC 队列。
+3. 后台日志线程从队列取出消息。
+4. 后台线程负责格式化和写文件。
+
+示例：
+
 ```cpp
-// UDP server with busy polling
-UDPServer server(8080, handler, true); // true = enable busy poll
-server.start();
-server.run(); // Busy poll loop
-
-// UDP multicast receiver
-UDPMulticastReceiver receiver("239.255.1.1", 8080, "192.168.1.1", handler, true);
-receiver.start();
-receiver.run();
+LOG_INFO("order accepted");
+LOG_INFO_F("order id=%u price=%ld", order_id, price);
 ```
 
-**Future Enhancements**:
-- DPDK for kernel bypass
-- Zero-copy techniques (sendfile, splice)
-- XDP (eXpress Data Path) for even lower latency
+优点：
 
-### 9. Compiler Optimizations
+- 业务线程不直接做文件 I/O。
+- 日志消息使用固定大小 buffer。
+- 队列满时可以选择丢弃日志，避免阻塞热路径。
 
-**Build Flags**:
+当前可改进点：
+
+- `writeLogMessage()` 中仍使用 `std::ostringstream`。
+- 时间格式化返回 `std::string`。
+- 如果追求更低延迟，可以改为固定栈缓冲区和 `snprintf`。
+
+---
+
+## 8. 网络优化
+
+### epoll TCP Server
+
+Linux 下的 `EpollServer` 使用：
+
+- `epoll_create1`
+- `epoll_ctl`
+- `epoll_wait`
+- 非阻塞 socket
+- edge-triggered 模式
+- `TCP_NODELAY`
+- `SO_REUSEADDR`
+- `SO_REUSEPORT`
+
+它适合高并发连接和事件驱动网络处理。`TCP_NODELAY` 用于关闭 Nagle 算法，减少小包等待。
+
+### UDP Busy Polling
+
+项目中的 UDP 模块包含 busy polling 思路。busy poll 可以让内核在短时间内轮询 socket 队列，减少睡眠/唤醒带来的延迟。
+
+代价是 CPU 占用更高，通常需要绑定独立 CPU 核。
+
+### 未来网络方向
+
+- DPDK：绕过内核网络栈。
+- XDP：在内核早期路径处理网络包。
+- zero-copy：减少数据拷贝。
+- 硬件时间戳：提高行情与交易事件时间精度。
+
+---
+
+## 9. 编译器优化
+
+Release 构建中会启用一组优化参数：
+
 ```cmake
--O3 -march=native -mtune=native
--flto                    # Link-time optimization
--ffast-math              # Aggressive floating-point optimizations
--funroll-loops           # Loop unrolling
--fno-exceptions          # No exception handling overhead
--fno-rtti                # No runtime type information
--finline-functions       # Aggressive inlining
--fomit-frame-pointer     # Omit frame pointers
+-O3
+-march=native
+-mtune=native
+-flto
+-ffast-math
+-funroll-loops
+-fno-exceptions
+-fno-rtti
+-finline-functions
+-fomit-frame-pointer
 ```
 
-**Link-Time Optimization (LTO)**:
-- Cross-module optimizations
-- Can improve performance by 10-20%
+说明：
 
-### 10. Header-Only Hot Paths
+- `-O3`：启用较激进优化。
+- `-march=native`：针对当前 CPU 指令集优化。
+- `-flto`：链接时优化，允许跨翻译单元优化。
+- `-fno-exceptions`：关闭异常支持，减少运行时开销。
+- `-fno-rtti`：关闭 RTTI。
+- `-fomit-frame-pointer`：释放寄存器，但可能影响调试和 profiling。
 
-Critical functions are implemented inline in headers:
-- Order comparison operators
-- Price level access
-- Matching logic
+这些选项适合性能实验，但生产环境需要结合调试、可观测性和安全要求权衡。
 
-**Benefits**:
-- Eliminates function call overhead
-- Enables better compiler optimizations
-- Reduces instruction cache misses
+---
 
-## Latency Targets
+## 10. 热路径头文件内联
 
-| Operation | Target | Measurement |
-|-----------|--------|-------------|
-| Order Add | < 1 μs | P99 latency |
-| Order Cancel | < 1 μs | P99 latency |
-| Order Match | < 2 μs | P99 latency |
-| Best Price Lookup | < 100 ns | P99 latency |
+项目中一些关键逻辑放在头文件里，例如：
 
-## Performance Monitoring
+- `Order` 内联访问函数。
+- `OrderBook` 主要操作。
+- `Matcher` 撮合逻辑。
 
-Use `hft::LatencyTimer` and `hft::Benchmark` for latency measurements:
+这样做的原因是：当调用点能看到函数实现时，编译器更容易内联并进一步优化。
+
+缺点是：
+
+- 编译时间可能增加。
+- 实现细节暴露在头文件中。
+- 头文件改动会触发更多文件重新编译。
+
+---
+
+## 延迟目标
+
+| 操作 | 目标 | 指标 |
+| --- | --- | --- |
+| 添加订单 | < 1 μs | P99 |
+| 撤销订单 | < 1 μs | P99 |
+| 撮合订单 | < 2 μs | P99 |
+| 最优价查询 | < 100 ns | P99 |
+
+这些目标用于指导优化方向，不代表当前代码在所有环境下都能达到。真实结果取决于硬件、编译器、系统配置、数据规模和 benchmark 方法。
+
+---
+
+## 性能监控
+
+可以使用 `LatencyTimer` 和 `Benchmark` 统计延迟：
 
 ```cpp
 hft::LatencyTimer timer;
-// ... operation ...
+
+// 执行待测逻辑
+
 int64_t latency_us = timer.elapsedUs();
 ```
 
-## System Configuration
+`Benchmark` 支持输出：
 
-### Required Linux Settings
+- count
+- min
+- max
+- mean
+- median
+- P50
+- P90
+- P95
+- P99
+- P99.9
 
-1. **Huge Pages**:
-   ```bash
-   echo 1024 > /proc/sys/vm/nr_hugepages
-   ```
+---
 
-2. **CPU Isolation** (via kernel parameters):
-   ```bash
-   isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
-   ```
+## Linux 系统配置建议
 
-3. **Disable CPU Frequency Scaling**:
-   ```bash
-   echo performance > /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-   ```
+### Huge Pages
 
-4. **Network Tuning**:
-   ```bash
-   # Increase socket buffer sizes
-   sysctl -w net.core.rmem_max=134217728
-   sysctl -w net.core.wmem_max=134217728
-   ```
-
-### Running with Privileges
-
-Some optimizations require root:
 ```bash
-sudo ./MarketDataEngine  # For mlockall and SCHED_FIFO
+echo 1024 > /proc/sys/vm/nr_hugepages
 ```
 
-## Best Practices
+### CPU 隔离
 
-1. **Profile First**: Use `perf` or `valgrind` to identify bottlenecks
-2. **Measure Everything**: Track P50, P90, P95, P99, P99.9 latencies
-3. **Avoid Dynamic Allocation**: Use memory pools in hot paths
-4. **Minimize System Calls**: Batch operations where possible
-5. **Cache Awareness**: Design data structures for cache locality
-6. **Branch Prediction**: Use `[[likely]]`/`[[unlikely]]` hints (C++20)
+可以通过内核参数隔离交易线程使用的 CPU：
 
-## Future Enhancements
+```bash
+isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
+```
 
-- [ ] Lock-free price ladder implementation
-- [ ] SIMD optimizations for batch operations
-- [ ] DPDK integration for kernel bypass networking
-- [ ] Custom memory allocator tuned for order book
-- [ ] Profile-guided optimization (PGO) builds
-- [ ] Hardware timestamping (PTP)
-- [ ] FPGA offload for matching engine
+### CPU 频率策略
 
-## References
+将 CPU governor 设置为 performance：
 
-- "Low Latency C++" by Agner Fog
-- "High Performance Trading" by Michael Driscoll
-- "Designing Low Latency Trading Systems" by Peter Lawrey
+```bash
+echo performance > /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
 
+### 网络缓冲区
+
+```bash
+sysctl -w net.core.rmem_max=134217728
+sysctl -w net.core.wmem_max=134217728
+```
+
+### root 权限
+
+以下能力通常需要 root 或额外 capability：
+
+- `mlockall`
+- `SCHED_FIFO`
+- 某些 socket busy poll 设置
+- huge page 配置
+
+---
+
+## 实践建议
+
+1. 先测量，再优化。
+2. 优先关注 P99 / P99.9，而不是只看平均值。
+3. 热路径避免动态分配。
+4. 热路径避免锁和阻塞 I/O。
+5. 数据结构要考虑 cache locality。
+6. 用 `[[likely]]` / `[[unlikely]]` 标注高频分支，但不要滥用。
+7. benchmark 要固定 CPU、固定频率，并减少后台干扰。
+8. 日志、监控、统计都应避免阻塞撮合路径。
+
+---
+
+## 后续优化方向
+
+- [ ] 实现更低分配成本的价格档位结构。
+- [ ] 为 `OrderBook` 和 `Matcher` 增加单元测试。
+- [ ] 为撮合路径增加系统化 benchmark。
+- [ ] 将异步日志格式化改成固定缓冲区。
+- [ ] 引入批量订单处理。
+- [ ] 增加持仓、成交回报、P&L 模块。
+- [ ] 增加 Linux CI 构建。
+- [ ] 探索 DPDK/XDP 网络路径。
+- [ ] 增加硬件时间戳或 PTP 支持。
+
+---
+
+## 参考方向
+
+- 低延迟 C++ 编程
+- Linux 性能调优
+- CPU cache 与 false sharing
+- lock-free 数据结构
+- exchange matching engine 设计
+- market data feed handler 设计

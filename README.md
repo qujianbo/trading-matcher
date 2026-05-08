@@ -1,53 +1,49 @@
-# Real-Time Market Data Feed Handler & Order Matching Engine
+# Trading Matcher
 
-## Description
+## 项目简介
 
-This project implements a **real-time market data feed handler** and an **order matching engine**, optimized for **High-Frequency Trading (HFT)** with microsecond-level latency targets. It is built in **modern C++** (C++20) following HFT industry best practices.
+本项目实现了一个面向高频交易场景的 **实时行情处理与订单撮合引擎**。核心代码使用现代 C++（C++20）编写，重点关注低延迟、缓存友好、固定点价格表示、无锁队列、内存池和 Linux 平台下的系统级优化。
 
-The system is designed with the following goals in mind:
-- **Ultra-low latency**: Microsecond-level order processing (< 1μs for P99 operations)
-- **Linux-optimized**: Designed specifically for Linux production environments
-- **Cache-efficient**: Data structures optimized for CPU cache locality
-- **Zero-allocation hot paths**: Memory pools prevent dynamic allocations during trading
-- **Real-time performance**: CPU affinity, memory locking, and real-time scheduling
+项目主要目标：
 
-**⚠️ Note**: This codebase is optimized for Linux and may not compile on macOS/Windows. It uses Linux-specific APIs and system calls.
+- **低延迟撮合**：订单处理路径尽量减少动态分配和系统调用。
+- **固定点价格**：使用整数表示价格，避免浮点误差。
+- **缓存友好结构**：`Order`、队列和内存池使用对齐优化。
+- **热路径零分配**：通过预分配内存池减少运行时堆分配。
+- **异步日志**：日志写入放到后台线程，避免阻塞撮合路径。
+- **Linux 优化**：包含 CPU 亲和性、NUMA、内存锁定、实时调度、epoll 等优化接口。
 
----
-
-## Features
-
-### HFT-Optimized Core
-- **Fixed-Point Prices**: 64-bit integer prices (micro-dollar precision) for deterministic arithmetic
-- **Price Ladder**: Efficient O(log n) insertion, O(1) best price lookup using sorted maps
-- **Cache-Aligned Orders**: 32-byte aligned Order structures (one cache line)
-- **Memory Pool**: Pre-allocated order pool eliminates dynamic allocations in hot paths
-- **Nanosecond Timestamps**: High-resolution timestamps for price-time priority matching
-
-### Linux Optimizations
-- **CPU Affinity & Thread Pinning**: Pin process and individual threads to specific CPU cores
-- **NUMA Awareness**: Allocate memory on the same NUMA node as CPU (reduces cross-NUMA latency)
-- **Memory Locking**: `mlockall()` prevents swapping to disk
-- **Real-Time Scheduling**: SCHED_FIFO priority for deterministic latency
-- **Huge Pages**: 2MB pages to reduce TLB misses
-- **Epoll Server**: High-performance event-driven TCP networking
-- **UDP Busy Polling**: SO_BUSY_POLL for ultra-low latency UDP (10-50μs improvement)
-
-### Performance
-- **Latency Measurement**: Built-in microsecond-precision latency tracking
-- **Benchmarking Tools**: Statistical analysis (P50, P90, P95, P99, P99.9)
-- **Compiler Optimizations**: Aggressive flags (-O3, -march=native, LTO, etc.)
-
-### Inter-Thread Communication
-- **Lock-Free SPSC Queue**: Single Producer Single Consumer queue for zero-latency inter-thread messaging
-- **Async Logger**: Non-blocking logging using SPSC queue and background thread
-- **Thread-Safe**: Designed for high-throughput producer-consumer patterns
-
-For detailed optimization documentation, see [HFT_OPTIMIZATIONS.md](HFT_OPTIMIZATIONS.md).
+> 注意：项目包含 Linux 专用优化代码。核心撮合逻辑可以在 macOS 上阅读和部分构建，但 `epoll`、NUMA、CPU affinity 等能力需要 Linux 环境。
 
 ---
 
-## Folder Structure
+## 核心功能
+
+### 订单与撮合
+
+- `Order` 使用 32 字节对齐结构，字段紧凑，适合缓存访问。
+- 价格使用 `int64_t` 固定点表示，默认精度为 `1e6`。
+- `OrderBook` 使用价格档位结构维护买卖盘。
+- `Matcher` 基于价格优先、时间优先原则执行撮合。
+- 成交后更新订单数量，并移除完全成交的订单。
+
+### 性能组件
+
+- `MemoryPool`：预分配 `Order` 对象，减少热路径动态分配。
+- `SPSCQueue`：单生产者单消费者无锁环形队列。
+- `AsyncLogger`：异步日志器，使用 SPSC 队列将日志交给后台线程写入。
+- `Timestamp`：提供纳秒级时间戳和 RDTSC 计时工具。
+- `Benchmark`：提供基础延迟统计，包括 P50、P90、P95、P99、P99.9。
+
+### 网络模块
+
+- `EpollServer`：Linux 下基于 epoll 的高性能 TCP server。
+- `UDPServer`：面向低延迟 UDP 场景的网络接口。
+- `Client` / `Server`：基础网络客户端和服务端示例。
+
+---
+
+## 目录结构
 
 ```bash
 .
@@ -60,148 +56,125 @@ For detailed optimization documentation, see [HFT_OPTIMIZATIONS.md](HFT_OPTIMIZA
 ├── src/
 │   ├── order_matching/
 │   ├── market_data/
-│   ├── networking/
-│   └── utils/
-├── tests/
-├── third_party/
-├── benchmarks/
-├── cmake/
+│   └── networking/
+├── docs/
+├── HFT_OPTIMIZATIONS.md
+├── SYSTEM_ARCHITECTURE.md
 └── README.md
 ```
 
-### Folder Overview
+主要目录说明：
 
-- **`include/`**: Contains header files for different modules (`order_matching`, `market_data`, `networking`, and `utils`).
-- **`src/`**: Contains the source code for the system implementation, organized into functional modules.
-- **`tests/`**: Unit tests for each module to ensure the system works as expected.
-- **`benchmarks/`**: Contains performance benchmarks for critical components.
-- **`third_party/`**: External libraries such as `curl` and `json.hpp` are integrated here.
+- `include/order_matching/`：订单、订单簿、撮合器等核心数据结构。
+- `include/utils/`：内存池、无锁队列、异步日志、时间戳、benchmark 工具。
+- `include/networking/`：TCP/UDP 网络相关封装。
+- `src/`：示例程序和部分模块实现。
+- `docs/`：项目说明、简历材料和面试准备文档。
 
 ---
 
-## Getting Started
+## 构建方式
 
-### Prerequisites
+### Linux
 
-- **Linux** (Ubuntu 20.04+, RHEL 8+, or similar)
-- **CMake** (version 3.15 or higher)
-- **GCC 10+** or **Clang 12+** with C++20 support
-- **Optional**: Boost (for networking features)
-- **Optional**: libcurl (for HTTP client features)
-
-**Note**: This project is optimized for Linux and uses Linux-specific APIs. It will not compile on macOS/Windows without modifications.
-
-### Building the Project
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/yourusername/market-data-order-matching-engine.git
-   cd market-data-order-matching-engine
-   ```
-
-2. Configure Linux system (recommended for production):
-
-   ```bash
-   # Enable huge pages
-   sudo sh -c 'echo 1024 > /proc/sys/vm/nr_hugepages'
-   
-   # Set CPU governor to performance
-   sudo cpupower frequency-set -g performance
-   ```
-
-3. Create a build directory:
-
-   ```bash
-   mkdir build && cd build
-   ```
-
-4. Configure with CMake (Release mode for optimizations):
-
-   ```bash
-   cmake -DCMAKE_BUILD_TYPE=Release ..
-   ```
-
-5. Build the project:
-
-   ```bash
-   make -j$(nproc)
-   ```
-
-6. Run the executable:
-
-   ```bash
-   # For full optimizations (requires root):
-   sudo ./bin/MarketDataEngine
-   
-   # Or without root (some optimizations disabled):
-   ./bin/MarketDataEngine
-   ```
-
-### Running Unit Tests
-
-The project includes unit tests written using a testing framework (e.g., Google Test or Catch2). To run the tests:
+推荐使用 Linux 构建和运行完整功能：
 
 ```bash
-make test
+git clone git@github.com:qujianbo/trading-matcher.git
+cd trading-matcher
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/bin/MarketDataEngine
 ```
 
-### Running Benchmarks
+如果需要启用部分系统级 HFT 优化，可能需要 root 权限或额外系统配置，例如内存锁定、实时调度、huge pages、CPU 亲和性等。
 
-To benchmark the system’s performance:
+### macOS
+
+macOS 没有 Linux 的 `epoll` 和部分系统 API，因此 Linux 专用网络优化不会启用。当前环境下如果 C++ 标准库路径没有被自动识别，可以显式指定：
 
 ```bash
-./benchmarks/BenchmarkOrderMatching
-./benchmarks/BenchmarkMarketData
+cmake -S . -B build -G "Unix Makefiles" \
+  -DCMAKE_CXX_FLAGS="-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
+cmake --build build
+./build/bin/MarketDataEngine
+```
+
+运行后日志默认写入：
+
+```bash
+market_engine.log
+```
+
+可以查看：
+
+```bash
+tail -f market_engine.log
 ```
 
 ---
 
-## Usage
+## 示例流程
 
-### Order Matching Engine
+`src/main.cpp` 演示了一个简单撮合流程：
 
-The order matching engine takes buy and sell orders, processes them in real-time, and matches them based on price and time priority. You can configure the engine with various order types (market, limit) and simulate trading activity using predefined order books.
-
-### Market Data Handler
-
-The market data handler fetches and processes live data streams from external APIs using `libcurl`. Data is parsed from JSON format using `json.hpp` and passed to the order matching engine to inform trading decisions.
-
----
-
-## Project Goals
-
-1. **Real-World Financial System Simulation**: The project simulates a real-world financial trading system, allowing developers to experience the challenges of high-frequency trading, real-time market data handling, and system performance optimization.
-   
-2. **Learning Modern C++**: This project is a great way to apply modern C++ features (C++20), including advanced data structures, concurrency, and performance optimizations.
-
-3. **Performance & Scalability**: Designed to handle high-frequency trading scenarios, the system is built for performance, with an emphasis on low-latency data processing and order matching.
+1. 初始化 RDTSC 校准器。
+2. 启动异步日志器。
+3. 创建 `OrderBook` 和 `Matcher`。
+4. 使用内存池分配订单。
+5. 加入买单和卖单。
+6. 执行撮合。
+7. 输出成交结果和订单簿状态。
+8. 演示 SPSC 队列在线程间传递订单。
 
 ---
 
-## Contributing
+## 设计重点
 
-Contributions are welcome! Feel free to submit pull requests for new features, optimizations, or bug fixes. Please make sure that all new code includes unit tests and follows the existing coding style.
+### 固定点价格
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/YourFeature`)
-3. Commit your changes (`git commit -am 'Add some feature'`)
-4. Push to the branch (`git push origin feature/YourFeature`)
-5. Create a new Pull Request
+价格类型定义为：
+
+```cpp
+using Price = int64_t;
+constexpr Price PRICE_SCALE = 1'000'000LL;
+```
+
+例如 `100.50` 会被转换成 `100500000`，避免浮点数在金融计算中的精度问题。
+
+### 订单结构对齐
+
+`Order` 使用：
+
+```cpp
+struct alignas(32) Order
+```
+
+目标是让订单对象保持 32 字节大小，两个订单可以较好地落在一个常见的 64 字节 cache line 中，提高缓存利用率。
+
+### 异步日志
+
+日志调用不会直接写文件，而是将 `LogMessage` 推入无锁 SPSC 队列，由后台线程负责格式化和输出，减少热路径阻塞。
+
+### 头文件内联
+
+`Matcher` 和 `OrderBook` 的主要逻辑放在头文件中，目的是让编译器在撮合热路径上更容易进行内联和跨函数优化。
 
 ---
 
-## License
+## 相关文档
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+- [HFT_OPTIMIZATIONS.md](HFT_OPTIMIZATIONS.md)：HFT 优化说明。
+- [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md)：系统架构说明。
 
 ---
 
-## Contact
+## 后续改进方向
 
-For any inquiries or further information, please contact:
-
-- **Author**: Ömer Halit Cinar
-- **Email**: omerhalidcinar@gmail.com
-
-Feel free to reach out with questions, feedback, or ideas for future improvements!
+- 完善订单生命周期管理。
+- 增加账户、持仓、成交回报和 P&L 模块。
+- 为核心撮合逻辑补充单元测试。
+- 改进 `OrderBook` 数据结构以减少 `std::map` 带来的分配成本。
+- 将异步日志格式化从 `ostringstream` 改成固定缓冲区。
+- 增加 Linux 环境下的 benchmark 和延迟统计报告。
+- 补充 CI 构建流程。
